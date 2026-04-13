@@ -18,8 +18,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--model",
-        default="qwen2.5-coder:32b",
-        help="Ollama model to use (default: qwen2.5-coder:32b)",
+        default="qwen3-coder:30b",
+        help="Ollama model to use (default: qwen3-coder:30b)",
     )
     parser.add_argument(
         "--host",
@@ -34,8 +34,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--ctx",
         type=int,
-        default=32768,
-        help="Context window in tokens (default: 32768)",
+        default=131072,
+        help="Context window in tokens (default: 131072)",
     )
     return parser.parse_args()
 
@@ -79,7 +79,17 @@ def main() -> None:
 
     config = AgentConfig.from_args(args)
     app = AgentApp(config)
-    app.run()
+    try:
+        app.run()
+    except BaseException:
+        # Textual restores the main screen on exit, so a traceback printed
+        # mid-run would otherwise be wiped. Capture, then re-raise.
+        import traceback
+
+        tb = traceback.format_exc()
+        print("\n--- TUI crashed ---")
+        print(tb)
+        raise
 
 
 if __name__ == "__main__":

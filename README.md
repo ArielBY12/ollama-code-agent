@@ -16,10 +16,10 @@ pip install -r requirements.txt
 ollama serve
 
 # 3. Pull a model (if you haven't already)
-ollama pull qwen2.5-coder:7b
+ollama pull qwen3-coder:30b
 
 # 4. Run the agent
-python main.py --model qwen2.5-coder:7b
+python main.py --model qwen3-coder:30b
 ```
 
 ## Setup (Windows)
@@ -27,25 +27,34 @@ python main.py --model qwen2.5-coder:7b
 ```powershell
 # 1. Install Python 3.10+ from https://python.org
 # 2. Install Ollama from https://ollama.com/download/windows
-#    (Ollama runs as a background service automatically after install)
+#    (runs as a background service automatically after install)
 
 # 3. Install dependencies
 pip install -r requirements.txt
 
 # 4. Pull a recommended model
-ollama pull qwen2.5-coder:7b
+ollama pull qwen3-coder:30b
 
-# 5. Run the agent
-python main.py --model qwen2.5-coder:7b
+# 5. Run the agent — from Windows Terminal, PowerShell, or cmd.exe
+python main.py --model qwen3-coder:30b
 ```
+
+> **Note:** Launch the TUI from a real Windows console (Windows Terminal,
+> PowerShell, or `cmd.exe`). Git Bash / MSYS shells do not provide a TTY
+> that Textual can drive — `python main.py` will print the header and
+> exit silently there.
 
 ## Recommended Models
 
-| Model              | Size   | RAM needed | Best for              |
-|--------------------|--------|------------|-----------------------|
-| `qwen2.5-coder:7b` | ~4.5 GB | 8 GB+     | Most machines         |
-| `qwen2.5-coder:14b`| ~9 GB  | 16 GB+     | Better quality        |
-| `qwen2.5-coder:32b`| ~19 GB | 32 GB+     | Best quality          |
+This project targets workstations with ~64 GB RAM, so the defaults lean
+toward larger models.
+
+| Model              | Size    | RAM needed | Best for                       |
+|--------------------|---------|------------|--------------------------------|
+| `qwen3-coder:30b`  | ~19 GB  | 32 GB+     | **Default** — strongest agent  |
+| `qwen2.5-coder:32b`| ~19 GB  | 32 GB+     | Alternative dense 32B          |
+| `qwen2.5-coder:14b`| ~9 GB   | 16 GB+     | Lighter machines               |
+| `qwen2.5-coder:7b` | ~4.5 GB | 8 GB+      | Lowest-resource fallback       |
 
 ## Usage
 
@@ -57,10 +66,10 @@ python main.py [options]
 
 | Flag        | Default                    | Description              |
 |-------------|----------------------------|--------------------------|
-| `--model`   | `qwen2.5-coder:32b`       | Ollama model to use      |
+| `--model`   | `qwen3-coder:30b`         | Ollama model to use      |
 | `--host`    | `http://localhost:11434`   | Ollama server URL        |
 | `--workdir` | `.`                        | Working directory        |
-| `--ctx`     | `32768`                    | Context window (tokens)  |
+| `--ctx`     | `131072`                   | Context window (tokens)  |
 
 ### Keybindings
 
@@ -87,3 +96,34 @@ The agent has access to the following tools:
 Once you've installed the dependencies and pulled a model, everything runs
 locally. No internet connection is needed. The agent talks to the Ollama
 server on your machine — your code never leaves your computer.
+
+## Tests
+
+Unit tests live in `tests/` and use the standard-library `unittest` runner
+— no extra dependencies needed.
+
+```bash
+python -m unittest discover tests -v
+```
+
+Coverage focuses on pure logic: `AgentConfig` wiring, `ToolExecutor` cap
+derivation and every tool's happy + error paths, and the fenced-JSON
+tool-call fallback parser. The live Ollama client and the Textual UI are
+intentionally not unit-tested — those are integration surfaces.
+
+## Architecture
+
+Three layers, strictly separated:
+
+1. **`config.py`** — `AgentConfig` frozen dataclass, the single source of
+   truth for runtime settings.
+2. **`agent/`** — UI-agnostic. `AgentLoop.run_turn()` yields typed events
+   (`ToolCallEvent`, `ToolResultEvent`, `AssistantMessageEvent`,
+   `ErrorEvent`) and caps turns at 25 tool-call iterations to guard
+   against runaway models.
+3. **`ui/`** — Textual frontend. Runs `AgentLoop` on a background worker
+   and marshals events back via `call_from_thread()`.
+
+Tool output is capped proportional to `--ctx` so smaller context windows
+get proportionally smaller reads/searches — preventing a single tool call
+from blowing the model's window.
