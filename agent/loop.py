@@ -8,8 +8,9 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
-from typing import Generator, Union
+import threading
+from dataclasses import dataclass, field
+from typing import Generator, Iterable, Union
 
 import ollama  # type: ignore[import-untyped]
 
@@ -38,10 +39,38 @@ class ToolResultEvent:
 
 
 @dataclass
-class AssistantMessageEvent:
-    """Final (non-tool-call) LLM response text."""
+class AssistantChunkEvent:
+    """A streamed delta of assistant text."""
 
     content: str
+
+
+@dataclass
+class AssistantMessageEvent:
+    """Final (non-tool-call) LLM response text.
+
+    Emitted once per streamed response with the fully assembled content,
+    so consumers that don't care about incremental rendering can ignore
+    AssistantChunkEvent and still get the full message.
+    """
+
+    content: str
+
+
+@dataclass
+class ConfirmRequestEvent:
+    """Ask the consumer to approve or deny a sensitive tool call.
+
+    The loop blocks on ``reply`` after yielding this event. The consumer
+    MUST append a single bool to ``approved`` and then set ``reply`` —
+    True to run the tool, False to synthesize a denial result without
+    executing.
+    """
+
+    name: str
+    args: dict
+    reply: threading.Event = field(default_factory=threading.Event)
+    approved: list[bool] = field(default_factory=list)
 
 
 @dataclass
@@ -52,8 +81,23 @@ class ErrorEvent:
 
 
 AgentEvent = Union[
-    ToolCallEvent, ToolResultEvent, AssistantMessageEvent, ErrorEvent
+    ToolCallEvent,
+    ToolResultEvent,
+    AssistantChunkEvent,
+    AssistantMessageEvent,
+    ConfirmRequestEvent,
+    ErrorEvent,
 ]
+
+
+# Tools whose execution requires explicit user approval each call.
+_SENSITIVE_TOOLS: frozenset[str] = frozenset(
+    {"run_bash", "write_file", "patch_file"}
+)
+
+# Default reply timeout for confirmation — generous, but bounded so a
+# detached frontend can't wedge the worker forever.
+_CONFIRM_TIMEOUT_SECONDS = 300.0
 
 
 # ── text-mode tool-call extraction ──────────────────────────────────
@@ -131,7 +175,7 @@ def _extract_text_tool_calls(content: str) -> list[dict]:
 
 # Hard ceiling on tool-call iterations per user turn. Guards against a
 # runaway model that keeps requesting tools forever.
-_MAX_TURN_ITERATIONS = 25
+_MAX_TURN_ITERATIONS = 100
 
 
 class AgentLoop:
@@ -157,7 +201,7 @@ class AgentLoop:
     ) -> Generator[AgentEvent, None, None]:
         """Send *user_message* and yield events until the LLM stops.
 
-        Handles multi-step tool-call chains automatically.
+        Handles multi-step tool-call chains and streaming automatically.
         """
         self._messages.append(
             {"role": "user", "content": user_message}
@@ -165,21 +209,36 @@ class AgentLoop:
 
         for _ in range(_MAX_TURN_ITERATIONS):
             try:
-                response = self._client.chat(
+                stream = self._client.chat(
                     model=self._config.model,
                     messages=self._messages,
                     tools=TOOL_SCHEMAS,
+                    stream=True,
+                    keep_alive="30m",
                     options={"num_ctx": self._config.ctx},
                 )
             except Exception as exc:
                 yield ErrorEvent(message=str(exc))
                 return
 
-            msg = response.get("message", {})
-            self._messages.append(msg)
+            try:
+                content, tool_calls, final_msg = yield from self._consume_stream(
+                    stream
+                )
+            except Exception as exc:
+                yield ErrorEvent(message=str(exc))
+                return
 
-            tool_calls = msg.get("tool_calls")
-            content = msg.get("content", "") or ""
+            # Store the assembled assistant turn on the conversation
+            # history. Some SDKs return a full message per chunk; keep the
+            # last one but overwrite its content/tool_calls with our own
+            # assembly so history is consistent regardless of SDK shape.
+            msg = dict(final_msg) if isinstance(final_msg, dict) else {}
+            msg.setdefault("role", "assistant")
+            msg["content"] = content
+            if tool_calls is not None:
+                msg["tool_calls"] = tool_calls
+            self._messages.append(msg)
 
             # Fallback: some models emit tool calls as fenced JSON in
             # `content` instead of using the structured field. Parser
@@ -210,6 +269,39 @@ class AgentLoop:
                 )
             )
 
+    def _consume_stream(
+        self, stream: Iterable[dict]
+    ) -> Generator[AgentEvent, None, tuple[str, list[dict] | None, dict]]:
+        """Drain the streamed chat iterator, yielding chunks as they arrive.
+
+        Returns the assembled (content, tool_calls, final_raw_message).
+        """
+        content_parts: list[str] = []
+        tool_calls: list[dict] | None = None
+        final_msg: dict = {}
+
+        for chunk in stream:
+            if not isinstance(chunk, dict):
+                # Some SDKs yield objects with a .model_dump() method; best
+                # effort — if it's not dict-shaped, skip the delta but keep
+                # looping so we drain the stream.
+                continue
+            msg = chunk.get("message") or {}
+            final_msg = msg if msg else final_msg
+
+            delta = msg.get("content") or ""
+            if delta:
+                content_parts.append(delta)
+                yield AssistantChunkEvent(content=delta)
+
+            calls = msg.get("tool_calls")
+            if calls:
+                # Structured tool calls arrive whole, not delta-by-delta,
+                # so the last non-empty one wins.
+                tool_calls = list(calls)
+
+        return ("".join(content_parts), tool_calls, final_msg)
+
     def _execute_tool_calls(
         self, tool_calls: list[dict]
     ) -> Generator[AgentEvent, None, None]:
@@ -229,15 +321,36 @@ class AgentLoop:
 
             yield ToolCallEvent(name=name, args=raw_args)
 
+            if name in _SENSITIVE_TOOLS:
+                approved = yield from self._await_confirmation(name, raw_args)
+                if not approved:
+                    result = f"ERROR: user denied execution of {name}"
+                    yield ToolResultEvent(name=name, result=result)
+                    self._append_tool_message(name, result, call_id)
+                    continue
+
             result = self._tools.dispatch(name, raw_args)
 
             yield ToolResultEvent(name=name, result=result)
+            self._append_tool_message(name, result, call_id)
 
-            tool_msg: dict = {
-                "role": "tool",
-                "name": name,
-                "content": result,
-            }
-            if call_id:
-                tool_msg["tool_call_id"] = call_id
-            self._messages.append(tool_msg)
+    def _await_confirmation(
+        self, name: str, args: dict
+    ) -> Generator[AgentEvent, None, bool]:
+        """Yield a ConfirmRequestEvent and block on the consumer's reply."""
+        event = ConfirmRequestEvent(name=name, args=args)
+        yield event
+        event.reply.wait(timeout=_CONFIRM_TIMEOUT_SECONDS)
+        return bool(event.approved and event.approved[0])
+
+    def _append_tool_message(
+        self, name: str, result: str, call_id: str | None
+    ) -> None:
+        tool_msg: dict = {
+            "role": "tool",
+            "name": name,
+            "content": result,
+        }
+        if call_id:
+            tool_msg["tool_call_id"] = call_id
+        self._messages.append(tool_msg)
