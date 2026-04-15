@@ -24,6 +24,17 @@ python main.py --model qwen3-coder:30b
 
 ## Setup (Windows)
 
+### Option 1: Download the prebuilt `.exe`
+
+Every push to `main` builds a Windows executable via GitHub Actions
+(`.github/workflows/build-windows-exe.yml`). Grab it from the
+[Actions](../../actions) tab → latest successful run → **Artifacts** →
+`ollama-code-agent-windows`. Unzip and run `ollama-code-agent.exe` in
+Windows Terminal / PowerShell / `cmd.exe`. You still need Ollama
+installed and a model pulled.
+
+### Option 2: Run from source
+
 ```powershell
 # 1. Install Python 3.10+ from https://python.org
 # 2. Install Ollama from https://ollama.com/download/windows
@@ -37,6 +48,14 @@ ollama pull qwen3-coder:30b
 
 # 5. Run the agent — from Windows Terminal, PowerShell, or cmd.exe
 python main.py --model qwen3-coder:30b
+```
+
+### Option 3: Build the `.exe` yourself
+
+```powershell
+pip install -r requirements.txt pyinstaller
+pyinstaller ollama_code_agent.spec --clean --noconfirm
+# Output: dist\ollama-code-agent.exe
 ```
 
 > **Note:** Launch the TUI from a real Windows console (Windows Terminal,
