@@ -9,13 +9,13 @@ from __future__ import annotations
 import json
 import re
 import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Generator, Iterable, Union
 
 import ollama  # type: ignore[import-untyped]
 
 from agent.prompts import SYSTEM_PROMPT
-from agent.tools.definitions import TOOL_SCHEMAS
+from agent.tools.definitions import SENSITIVE_TOOL_NAMES, TOOL_SCHEMAS
 from agent.tools.executor import ToolExecutor
 from config import AgentConfig
 
@@ -24,59 +24,57 @@ from config import AgentConfig
 
 @dataclass
 class ToolCallEvent:
-    """The LLM decided to invoke a tool."""
-
     name: str
     args: dict
 
 
 @dataclass
 class ToolResultEvent:
-    """A tool finished executing."""
-
     name: str
     result: str
 
 
 @dataclass
 class AssistantChunkEvent:
-    """A streamed delta of assistant text."""
-
     content: str
 
 
 @dataclass
 class AssistantMessageEvent:
-    """Final (non-tool-call) LLM response text.
-
-    Emitted once per streamed response with the fully assembled content,
-    so consumers that don't care about incremental rendering can ignore
-    AssistantChunkEvent and still get the full message.
-    """
+    """Final assistant text; emitted only when a turn ends without a tool call."""
 
     content: str
 
 
-@dataclass
 class ConfirmRequestEvent:
     """Ask the consumer to approve or deny a sensitive tool call.
 
-    The loop blocks on ``reply`` after yielding this event. The consumer
-    MUST append a single bool to ``approved`` and then set ``reply`` —
-    True to run the tool, False to synthesize a denial result without
-    executing.
+    The loop yields this event and then calls ``wait()``; the consumer
+    calls ``approve()`` or ``deny()`` to unblock. Missing reply within
+    the timeout is treated as a denial so a detached frontend can't
+    wedge the worker forever.
     """
 
-    name: str
-    args: dict
-    reply: threading.Event = field(default_factory=threading.Event)
-    approved: list[bool] = field(default_factory=list)
+    def __init__(self, name: str, args: dict) -> None:
+        self.name = name
+        self.args = args
+        self._reply = threading.Event()
+        self._approved = False
+
+    def approve(self) -> None:
+        self._approved = True
+        self._reply.set()
+
+    def deny(self) -> None:
+        self._approved = False
+        self._reply.set()
+
+    def wait(self, timeout: float) -> bool:
+        return self._reply.wait(timeout=timeout) and self._approved
 
 
 @dataclass
 class ErrorEvent:
-    """Something went wrong during the turn."""
-
     message: str
 
 
@@ -90,13 +88,6 @@ AgentEvent = Union[
 ]
 
 
-# Tools whose execution requires explicit user approval each call.
-_SENSITIVE_TOOLS: frozenset[str] = frozenset(
-    {"run_bash", "write_file", "patch_file"}
-)
-
-# Default reply timeout for confirmation — generous, but bounded so a
-# detached frontend can't wedge the worker forever.
 _CONFIRM_TIMEOUT_SECONDS = 300.0
 
 
@@ -108,9 +99,104 @@ _CONFIRM_TIMEOUT_SECONDS = 300.0
 
 _FENCE_RE = re.compile(r"```(?:json|tool_call)?\s*\n?(.*?)```", re.DOTALL)
 
+# `<tool_call>...</tool_call>` envelope (Qwen/Hermes). Body may be JSON or
+# further tag-based markup — we hand the inner text back to the main parser.
+_TOOL_CALL_TAG_RE = re.compile(
+    r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL
+)
+
+# `<function=NAME> ... </function>` block (Llama 3.1 built-in). Body is
+# either JSON arguments or a sequence of `<parameter=KEY>VALUE</parameter>`
+# children.
+_FUNCTION_TAG_RE = re.compile(
+    r"<function\s*=\s*([A-Za-z_][A-Za-z0-9_]*)\s*>(.*?)</function>",
+    re.DOTALL,
+)
+
+_PARAMETER_TAG_RE = re.compile(
+    r"<parameter\s*=\s*([A-Za-z_][A-Za-z0-9_]*)\s*>(.*?)</parameter>",
+    re.DOTALL,
+)
+
+
+def _coerce_param_value(raw: str) -> object:
+    """Best-effort decode of a tag-wrapped parameter value.
+
+    Parameter bodies arrive as raw text. Try JSON first so numbers, bools,
+    and nested objects round-trip; fall back to the stripped string so path
+    arguments like `.` stay usable.
+    """
+    text = raw.strip()
+    if not text:
+        return ""
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return text
+
+
+def _parse_function_tag_body(name: str, body: str) -> dict | None:
+    params = _PARAMETER_TAG_RE.findall(body)
+    if params:
+        args: dict = {k: _coerce_param_value(v) for k, v in params}
+        return {"function": {"name": name, "arguments": args}}
+    # No <parameter> children — try JSON arguments instead.
+    stripped = body.strip()
+    if not stripped:
+        return {"function": {"name": name, "arguments": {}}}
+    try:
+        args_obj = json.loads(stripped)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(args_obj, dict):
+        return None
+    return {"function": {"name": name, "arguments": args_obj}}
+
+
+def _extract_tag_tool_calls(content: str) -> list[dict]:
+    """Parse XML-ish tool-call tags some models emit instead of JSON fences.
+
+    Handles two shapes that show up in Ollama model output:
+      * ``<tool_call>{"name": ..., "arguments": {...}}</tool_call>``
+      * ``<function=NAME>`` + ``<parameter=KEY>VALUE</parameter>`` children
+    A ``<tool_call>`` envelope may wrap either — we recurse into its body.
+    """
+    calls: list[dict] = []
+
+    for match in _TOOL_CALL_TAG_RE.finditer(content):
+        inner = match.group(1)
+        fn_matches = list(_FUNCTION_TAG_RE.finditer(inner))
+        if fn_matches:
+            for fm in fn_matches:
+                call = _parse_function_tag_body(fm.group(1), fm.group(2))
+                if call is not None:
+                    calls.append(call)
+            continue
+        try:
+            data = json.loads(inner.strip())
+        except json.JSONDecodeError:
+            continue
+        items = data if isinstance(data, list) else [data]
+        for item in items:
+            call = _coerce_call(item)
+            if call is not None:
+                calls.append(call)
+
+    # Also catch `<function=...>` blocks that appear outside a `<tool_call>`
+    # envelope (Llama 3.1 chat template emits them bare).
+    consumed_spans = [m.span() for m in _TOOL_CALL_TAG_RE.finditer(content)]
+    for fm in _FUNCTION_TAG_RE.finditer(content):
+        start, end = fm.span()
+        if any(s <= start and end <= e for s, e in consumed_spans):
+            continue
+        call = _parse_function_tag_body(fm.group(1), fm.group(2))
+        if call is not None:
+            calls.append(call)
+
+    return calls
+
 
 def _coerce_call(item: object) -> dict | None:
-    """Shape one parsed object into an SDK-style tool-call dict, or None."""
     if not isinstance(item, dict):
         return None
     name = item.get("name")
@@ -168,6 +254,9 @@ def _extract_text_tool_calls(content: str) -> list[dict]:
                 calls.append(call)
     if calls:
         return calls
+    tag_calls = _extract_tag_tool_calls(content)
+    if tag_calls:
+        return tag_calls
     return _scan_bare_json(content)
 
 
@@ -179,8 +268,6 @@ _MAX_TURN_ITERATIONS = 100
 
 
 class AgentLoop:
-    """Manages conversation history and drives multi-step tool use."""
-
     def __init__(self, config: AgentConfig) -> None:
         self._config = config
         self._client = ollama.Client(host=config.host)
@@ -193,7 +280,6 @@ class AgentLoop:
         ]
 
     def clear(self) -> None:
-        """Reset conversation history, keeping only the system prompt."""
         self._messages = [self._messages[0]]
 
     def run_turn(
@@ -229,10 +315,8 @@ class AgentLoop:
                 yield ErrorEvent(message=str(exc))
                 return
 
-            # Store the assembled assistant turn on the conversation
-            # history. Some SDKs return a full message per chunk; keep the
-            # last one but overwrite its content/tool_calls with our own
-            # assembly so history is consistent regardless of SDK shape.
+            # Some SDKs return a full message per chunk; keep the last
+            # one but overwrite content/tool_calls with our own assembly.
             msg = dict(final_msg) if isinstance(final_msg, dict) else {}
             msg.setdefault("role", "assistant")
             msg["content"] = content
@@ -240,10 +324,9 @@ class AgentLoop:
                 msg["tool_calls"] = tool_calls
             self._messages.append(msg)
 
-            # Fallback: some models emit tool calls as fenced JSON in
-            # `content` instead of using the structured field. Parser
-            # returns shape-valid calls; we filter to registered tools
-            # so spurious JSON doesn't round-trip as "unknown tool".
+            # Fallback for models that emit tool calls as fenced JSON in
+            # `content` instead of the structured field. Filter to known
+            # tools so spurious JSON doesn't round-trip as "unknown tool".
             if not tool_calls and content:
                 extracted = [
                     c
@@ -259,7 +342,6 @@ class AgentLoop:
                     yield AssistantMessageEvent(content=content)
                 return
 
-            # Process each tool call, then loop for the next LLM turn.
             yield from self._execute_tool_calls(tool_calls)
         else:
             yield ErrorEvent(
@@ -282,9 +364,6 @@ class AgentLoop:
 
         for chunk in stream:
             if not isinstance(chunk, dict):
-                # Some SDKs yield objects with a .model_dump() method; best
-                # effort — if it's not dict-shaped, skip the delta but keep
-                # looping so we drain the stream.
                 continue
             msg = chunk.get("message") or {}
             final_msg = msg if msg else final_msg
@@ -296,8 +375,7 @@ class AgentLoop:
 
             calls = msg.get("tool_calls")
             if calls:
-                # Structured tool calls arrive whole, not delta-by-delta,
-                # so the last non-empty one wins.
+                # Structured tool calls arrive whole, not delta-by-delta.
                 tool_calls = list(calls)
 
         return ("".join(content_parts), tool_calls, final_msg)
@@ -312,7 +390,6 @@ class AgentLoop:
             raw_args = func_info.get("arguments", {})
             call_id = tc.get("id")
 
-            # Normalise args: the SDK may hand us a JSON string.
             if isinstance(raw_args, str):
                 try:
                     raw_args = json.loads(raw_args)
@@ -321,7 +398,7 @@ class AgentLoop:
 
             yield ToolCallEvent(name=name, args=raw_args)
 
-            if name in _SENSITIVE_TOOLS:
+            if name in SENSITIVE_TOOL_NAMES:
                 approved = yield from self._await_confirmation(name, raw_args)
                 if not approved:
                     result = f"ERROR: user denied execution of {name}"
@@ -337,11 +414,9 @@ class AgentLoop:
     def _await_confirmation(
         self, name: str, args: dict
     ) -> Generator[AgentEvent, None, bool]:
-        """Yield a ConfirmRequestEvent and block on the consumer's reply."""
         event = ConfirmRequestEvent(name=name, args=args)
         yield event
-        event.reply.wait(timeout=_CONFIRM_TIMEOUT_SECONDS)
-        return bool(event.approved and event.approved[0])
+        return event.wait(timeout=_CONFIRM_TIMEOUT_SECONDS)
 
     def _append_tool_message(
         self, name: str, result: str, call_id: str | None

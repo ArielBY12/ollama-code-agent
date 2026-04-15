@@ -132,9 +132,10 @@ Three layers, strictly separated:
 1. **`config.py`** — `AgentConfig` frozen dataclass, the single source of
    truth for runtime settings.
 2. **`agent/`** — UI-agnostic. `AgentLoop.run_turn()` yields typed events
-   (`ToolCallEvent`, `ToolResultEvent`, `AssistantMessageEvent`,
-   `ErrorEvent`) and caps turns at 25 tool-call iterations to guard
-   against runaway models.
+   (`ToolCallEvent`, `ToolResultEvent`, `AssistantChunkEvent`,
+   `AssistantMessageEvent`, `ConfirmRequestEvent`, `ErrorEvent`) and
+   caps turns at 100 tool-call iterations to guard against runaway
+   models.
 3. **`ui/`** — Textual frontend. Runs `AgentLoop` on a background worker
    and marshals events back via `call_from_thread()`.
 

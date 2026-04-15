@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import tempfile
-import threading
 import unittest
 from pathlib import Path
 from typing import Any, Iterator
@@ -44,7 +43,6 @@ class FakeClient:
         if isinstance(item, Exception):
             raise item
         if isinstance(item, dict):
-            # Shorthand — lift to a single-chunk stream.
             chunks = [item]
         else:
             chunks = list(item)
@@ -80,8 +78,6 @@ class RunTurnTests(unittest.TestCase):
     def test_direct_answer_without_tools(self) -> None:
         loop, _ = _make_loop([_msg(content="hello there")])
         events = list(loop.run_turn("hi"))
-        # AssistantChunkEvent (one per char-less shorthand = one chunk) +
-        # AssistantMessageEvent final.
         self.assertIsInstance(events[-1], AssistantMessageEvent)
         self.assertEqual(events[-1].content, "hello there")
 
@@ -142,7 +138,6 @@ class RunTurnTests(unittest.TestCase):
         # Unknown-name JSON falls through to the AssistantMessageEvent path,
         # NOT dispatched as a bogus tool call.
         self.assertIsInstance(events[-1], AssistantMessageEvent)
-        # No tool events emitted.
         self.assertFalse(any(isinstance(e, ToolCallEvent) for e in events))
 
     def test_client_exception_becomes_error_event(self) -> None:
@@ -196,8 +191,10 @@ class ConfirmationTests(unittest.TestCase):
         for ev in gen:
             events.append(ev)
             if isinstance(ev, ConfirmRequestEvent):
-                ev.approved.append(decision)
-                ev.reply.set()
+                if decision:
+                    ev.approve()
+                else:
+                    ev.deny()
         return events
 
     def test_sensitive_tool_emits_confirm_request(self) -> None:

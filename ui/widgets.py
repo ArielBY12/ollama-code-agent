@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Literal
+
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
@@ -12,9 +14,9 @@ from rich.markdown import Markdown
 from rich.panel import Panel
 
 
-# Summarising a tool result down to one line keeps the compact row
-# readable while the full payload remains in model history.
 _TOOL_RESULT_SUMMARY_CHARS = 120
+
+ToolRowKind = Literal["call", "result"]
 
 
 def _one_line(text: str, limit: int = _TOOL_RESULT_SUMMARY_CHARS) -> str:
@@ -26,8 +28,6 @@ def _one_line(text: str, limit: int = _TOOL_RESULT_SUMMARY_CHARS) -> str:
 
 
 class ChatDisplay(VerticalScroll):
-    """Scrollable area that renders conversation bubbles."""
-
     DEFAULT_CSS = """
     ChatDisplay {
         height: 1fr;
@@ -47,25 +47,23 @@ class ChatDisplay(VerticalScroll):
 
     def __init__(self) -> None:
         super().__init__()
-        # Tracks the last streaming-assistant widget so chunk deltas
-        # append in place instead of creating a new bubble per token.
         self._active_assistant: Static | None = None
         self._active_text: str = ""
+        self._hidden: dict[ToolRowKind, bool] = {"call": True, "result": True}
 
     def add_user_message(self, text: str) -> None:
-        """Append a user bubble to the chat."""
         self._active_assistant = None
         self._active_text = ""
-        panel = Panel(
-            text,
-            title="You",
-            border_style="cyan",
-            expand=True,
-        )
+        panel = Panel(text, title="You", border_style="cyan", expand=True)
         self.mount(Static(panel))
         self.scroll_end(animate=False)
 
-    def _render_assistant_panel(self, text: str) -> Panel:
+    def _streaming_panel(self, text: str) -> Panel:
+        # Plain text during stream — Markdown parsing per-token is O(N²)
+        # over assembled length, so defer rich rendering to finalize.
+        return Panel(text, title="Assistant", border_style="green", expand=True)
+
+    def _final_panel(self, text: str) -> Panel:
         return Panel(
             Markdown(text) if text else "",
             title="Assistant",
@@ -74,86 +72,58 @@ class ChatDisplay(VerticalScroll):
         )
 
     def add_assistant_chunk(self, delta: str) -> None:
-        """Append streamed text to the in-progress assistant bubble."""
         if not delta:
             return
         self._active_text += delta
         if self._active_assistant is None:
-            self._active_assistant = Static(
-                self._render_assistant_panel(self._active_text)
-            )
+            self._active_assistant = Static(self._streaming_panel(self._active_text))
             self.mount(self._active_assistant)
         else:
-            self._active_assistant.update(
-                self._render_assistant_panel(self._active_text)
-            )
+            self._active_assistant.update(self._streaming_panel(self._active_text))
         self.scroll_end(animate=False)
 
     def finalize_assistant_message(self, text: str) -> None:
-        """Commit the assistant bubble after the stream completes.
-
-        If streaming produced a bubble, update it with the authoritative
-        full text (guards against delta desync). Otherwise mount a fresh
-        bubble — covers non-streaming code paths.
-        """
+        """Re-renders once with the full text to guard against delta desync."""
         if self._active_assistant is not None:
             self._active_text = text
-            self._active_assistant.update(
-                self._render_assistant_panel(text)
-            )
+            self._active_assistant.update(self._final_panel(text))
         else:
-            self.mount(Static(self._render_assistant_panel(text)))
+            self.mount(Static(self._final_panel(text)))
         self._active_assistant = None
         self._active_text = ""
         self.scroll_end(animate=False)
 
-    def add_tool_call(self, name: str, args: dict, hidden: bool) -> None:
-        """Show a compact single-line tool-call row."""
-        summary = _one_line(f"{name}({args})")
-        widget = Static(f"[dim]⚙ {summary}[/dim]", classes="tool-row tool-call")
-        if hidden:
-            widget.add_class("hidden")
-        self.mount(widget)
-        self.scroll_end(animate=False)
-
-    def add_tool_result(self, name: str, result: str, hidden: bool) -> None:
-        """Show a compact single-line tool-result row."""
-        summary = _one_line(result)
-        style = "red" if result.startswith("ERROR:") else "dim"
-        widget = Static(
-            f"[{style}]↳ {name}: {summary}[/{style}]",
-            classes="tool-row tool-result",
-        )
-        if hidden:
+    def add_tool_row(self, kind: ToolRowKind, name: str, body: str) -> None:
+        if kind == "call":
+            glyph, summary, style = "⚙", _one_line(f"{name}({body})"), "dim"
+            text = f"[{style}]{glyph} {summary}[/{style}]"
+        else:
+            summary = _one_line(body)
+            style = "red" if body.startswith("ERROR:") else "dim"
+            text = f"[{style}]↳ {name}: {summary}[/{style}]"
+        widget = Static(text, classes=f"tool-row tool-{kind}")
+        if self._hidden[kind]:
             widget.add_class("hidden")
         self.mount(widget)
         self.scroll_end(animate=False)
 
     def add_error(self, text: str) -> None:
-        """Show an error message."""
         self._active_assistant = None
         self._active_text = ""
-        panel = Panel(
-            text,
-            title="Error",
-            border_style="red",
-            expand=True,
-        )
+        panel = Panel(text, title="Error", border_style="red", expand=True)
         self.mount(Static(panel))
         self.scroll_end(animate=False)
 
-    def set_tool_calls_hidden(self, hidden: bool) -> None:
-        for w in self.query(".tool-call"):
+    def toggle_rows_hidden(self, kind: ToolRowKind) -> bool:
+        """Returns the new hidden state."""
+        hidden = not self._hidden[kind]
+        self._hidden[kind] = hidden
+        for w in self.query(f".tool-{kind}"):
             w.set_class(hidden, "hidden")
-
-    def set_tool_results_hidden(self, hidden: bool) -> None:
-        for w in self.query(".tool-result"):
-            w.set_class(hidden, "hidden")
+        return hidden
 
 
 class PromptInput(Input):
-    """Single-line input with a submit message."""
-
     DEFAULT_CSS = """
     PromptInput {
         dock: bottom;
@@ -169,13 +139,9 @@ class PromptInput(Input):
             self.text = text
 
     def __init__(self) -> None:
-        super().__init__(
-            placeholder="Type a message…",
-            id="prompt-input",
-        )
+        super().__init__(placeholder="Type a message…", id="prompt-input")
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
-        """Relay non-empty submissions as a PromptInput.Submitted."""
         text = event.value.strip()
         if text:
             self.clear()
@@ -183,8 +149,6 @@ class PromptInput(Input):
 
 
 class ConfirmModal(ModalScreen[bool]):
-    """Blocks the UI until the user approves or denies a tool call."""
-
     BINDINGS = [
         Binding("y", "decide(True)", "Approve"),
         Binding("n", "decide(False)", "Deny"),
@@ -227,9 +191,7 @@ class ConfirmModal(ModalScreen[bool]):
     def compose(self) -> ComposeResult:
         preview = _build_preview(self._tool_name, self._args)
         with Vertical(id="dialog"):
-            yield Static(
-                f"[b]Confirm tool:[/b] [yellow]{self._tool_name}[/yellow]"
-            )
+            yield Static(f"[b]Confirm tool:[/b] [yellow]{self._tool_name}[/yellow]")
             yield Static(preview, id="preview")
             yield Static("[dim]y = approve · n/Esc = deny[/dim]")
             with Horizontal():
@@ -267,5 +229,4 @@ def _build_preview(name: str, args: dict) -> str:
             f"[red]- {old}[/red]\n"
             f"[green]+ {new}[/green]"
         )
-    # Fallback for any future sensitive tool.
     return str(args)

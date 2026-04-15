@@ -4,6 +4,13 @@ No imports, no side effects — pure data only.
 Each schema follows the Ollama / OpenAI function-calling format.
 """
 
+# Tools that mutate disk or execute arbitrary code. The agent loop gates
+# each call on an explicit user confirmation before dispatch.
+SENSITIVE_TOOL_NAMES: frozenset[str] = frozenset(
+    {"run_bash", "write_file", "patch_file"}
+)
+
+
 TOOL_SCHEMAS: list[dict] = [
     {
         "type": "function",
