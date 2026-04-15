@@ -73,12 +73,26 @@ python main.py [options]
 
 ### Keybindings
 
-| Key     | Action                |
-|---------|-----------------------|
-| Enter   | Send message          |
-| Ctrl+L  | Clear chat            |
-| Ctrl+N  | New session           |
-| Ctrl+C  | Quit                  |
+| Key     | Action                         |
+|---------|--------------------------------|
+| Enter   | Send message                   |
+| Ctrl+T  | Toggle tool-call rows          |
+| Ctrl+R  | Toggle tool-result rows        |
+| Ctrl+L  | Clear chat                     |
+| Ctrl+N  | New session                    |
+| Ctrl+C  | Quit                           |
+
+Tool calls and their results are **hidden by default** — the chat shows
+only your messages and the assistant's streamed replies. Press `Ctrl+T`
+to reveal the compact tool-call rows (`⚙ read_file(...)`) and `Ctrl+R`
+to reveal the one-line tool-result rows. Each toggle is independent.
+
+### Sensitive-tool confirmation
+
+`run_bash`, `write_file`, and `patch_file` are gated by a confirmation
+modal before execution — review the command / path / diff preview, then
+approve (`y`) or deny (`n` / `Esc`). A denial is reported back to the
+model as `ERROR: user denied execution of <tool>` so it can recover.
 
 ## Available Tools
 

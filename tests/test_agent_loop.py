@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import tempfile
+import threading
 import unittest
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 from unittest.mock import patch
 
 from agent.loop import (
     AgentLoop,
+    AssistantChunkEvent,
     AssistantMessageEvent,
+    ConfirmRequestEvent,
     ErrorEvent,
     ToolCallEvent,
     ToolResultEvent,
@@ -20,24 +23,49 @@ from config import AgentConfig
 
 
 class FakeClient:
-    """Stand-in for ollama.Client that replays scripted chat responses."""
+    """Stand-in for ollama.Client that replays scripted streaming responses.
+
+    Each scripted response is either an Exception (raised on .chat()) or a
+    list of chunk dicts — each chunk shaped like Ollama's stream output
+    (``{"message": {"role": "assistant", "content": str, "tool_calls": ...}}``).
+    Callers can pass a plain ``{"message": {...}}`` dict as shorthand and
+    it will be lifted to a one-chunk stream automatically.
+    """
 
     def __init__(self, host: str = "", responses: list[Any] | None = None) -> None:
         self._responses = list(responses or [])
         self.calls: list[dict] = []
 
-    def chat(self, **kwargs: Any) -> Any:
+    def chat(self, **kwargs: Any) -> Iterator[dict]:
         self.calls.append(kwargs)
         if not self._responses:
             raise AssertionError("FakeClient exhausted — test scripted too few responses")
         item = self._responses.pop(0)
         if isinstance(item, Exception):
             raise item
-        return item
+        if isinstance(item, dict):
+            # Shorthand — lift to a single-chunk stream.
+            chunks = [item]
+        else:
+            chunks = list(item)
+        return iter(chunks)
 
 
 def _msg(content: str = "", tool_calls: list[dict] | None = None) -> dict:
     return {"message": {"role": "assistant", "content": content, "tool_calls": tool_calls}}
+
+
+def _stream_chunks(content: str, tool_calls: list[dict] | None = None) -> list[dict]:
+    """Break *content* into per-character chunks; append tool_calls at end."""
+    chunks: list[dict] = [
+        {"message": {"role": "assistant", "content": ch, "tool_calls": None}}
+        for ch in content
+    ]
+    if tool_calls is not None:
+        chunks.append(
+            {"message": {"role": "assistant", "content": "", "tool_calls": tool_calls}}
+        )
+    return chunks
 
 
 def _make_loop(responses: list[Any], workdir: Path | None = None) -> tuple[AgentLoop, FakeClient]:
@@ -52,9 +80,18 @@ class RunTurnTests(unittest.TestCase):
     def test_direct_answer_without_tools(self) -> None:
         loop, _ = _make_loop([_msg(content="hello there")])
         events = list(loop.run_turn("hi"))
-        self.assertEqual(len(events), 1)
-        self.assertIsInstance(events[0], AssistantMessageEvent)
-        self.assertEqual(events[0].content, "hello there")
+        # AssistantChunkEvent (one per char-less shorthand = one chunk) +
+        # AssistantMessageEvent final.
+        self.assertIsInstance(events[-1], AssistantMessageEvent)
+        self.assertEqual(events[-1].content, "hello there")
+
+    def test_streaming_emits_chunks_and_final(self) -> None:
+        loop, _ = _make_loop([_stream_chunks("hi!")])
+        events = list(loop.run_turn("ping"))
+        chunk_deltas = [e.content for e in events if isinstance(e, AssistantChunkEvent)]
+        self.assertEqual("".join(chunk_deltas), "hi!")
+        self.assertIsInstance(events[-1], AssistantMessageEvent)
+        self.assertEqual(events[-1].content, "hi!")
 
     def test_single_structured_tool_call_then_final_answer(self) -> None:
         with tempfile.TemporaryDirectory() as d:
@@ -70,13 +107,11 @@ class RunTurnTests(unittest.TestCase):
             ])
             events = list(loop.run_turn("read it"))
             kinds = [type(e).__name__ for e in events]
-            self.assertEqual(
-                kinds,
-                ["ToolCallEvent", "ToolResultEvent", "AssistantMessageEvent"],
-            )
-            result_event = events[1]
-            assert isinstance(result_event, ToolResultEvent)
-            self.assertEqual(result_event.result, "payload")
+            self.assertIn("ToolCallEvent", kinds)
+            self.assertIn("ToolResultEvent", kinds)
+            self.assertIsInstance(events[-1], AssistantMessageEvent)
+            result_events = [e for e in events if isinstance(e, ToolResultEvent)]
+            self.assertEqual(result_events[0].result, "payload")
             # tool_call_id was threaded back into history
             tool_msg = [m for m in loop._messages if m.get("role") == "tool"][0]
             self.assertEqual(tool_msg["tool_call_id"], "call_1")
@@ -106,8 +141,7 @@ class RunTurnTests(unittest.TestCase):
         events = list(loop.run_turn("say hi"))
         # Unknown-name JSON falls through to the AssistantMessageEvent path,
         # NOT dispatched as a bogus tool call.
-        self.assertEqual(len(events), 1)
-        self.assertIsInstance(events[0], AssistantMessageEvent)
+        self.assertIsInstance(events[-1], AssistantMessageEvent)
         # No tool events emitted.
         self.assertFalse(any(isinstance(e, ToolCallEvent) for e in events))
 
@@ -139,6 +173,71 @@ class RunTurnTests(unittest.TestCase):
         loop.clear()
         self.assertEqual(len(loop._messages), 1)
         self.assertEqual(loop._messages[0]["role"], "system")
+
+
+class ConfirmationTests(unittest.TestCase):
+    """Sensitive tools must emit ConfirmRequestEvent and honour approve/deny."""
+
+    def _script_run_bash_then_reply(self) -> list[dict]:
+        tc = [{
+            "function": {
+                "name": "run_bash",
+                "arguments": {"command": "echo hi"},
+            },
+        }]
+        return [_msg(tool_calls=tc), _msg(content="done")]
+
+    def _approve_and_collect(
+        self, loop: AgentLoop, user_text: str, decision: bool
+    ) -> list[object]:
+        """Drive run_turn, responding to any ConfirmRequestEvent with *decision*."""
+        events: list[object] = []
+        gen = loop.run_turn(user_text)
+        for ev in gen:
+            events.append(ev)
+            if isinstance(ev, ConfirmRequestEvent):
+                ev.approved.append(decision)
+                ev.reply.set()
+        return events
+
+    def test_sensitive_tool_emits_confirm_request(self) -> None:
+        loop, _ = _make_loop(self._script_run_bash_then_reply())
+        events = self._approve_and_collect(loop, "run it", True)
+        self.assertTrue(any(isinstance(e, ConfirmRequestEvent) for e in events))
+
+    def test_approved_tool_runs(self) -> None:
+        loop, _ = _make_loop(self._script_run_bash_then_reply())
+        events = self._approve_and_collect(loop, "run it", True)
+        result = next(e for e in events if isinstance(e, ToolResultEvent))
+        # echo hi produces "hi\n" and an exit-code footer.
+        self.assertIn("hi", result.result)
+        self.assertIn("exit code: 0", result.result)
+
+    def test_denied_tool_yields_error_result(self) -> None:
+        loop, _ = _make_loop(self._script_run_bash_then_reply())
+        events = self._approve_and_collect(loop, "run it", False)
+        result = next(e for e in events if isinstance(e, ToolResultEvent))
+        self.assertTrue(result.result.startswith("ERROR: user denied"))
+        # Denial still appends to history so the model sees the outcome.
+        tool_msgs = [m for m in loop._messages if m.get("role") == "tool"]
+        self.assertEqual(len(tool_msgs), 1)
+        self.assertIn("user denied", tool_msgs[0]["content"])
+
+    def test_non_sensitive_tool_is_not_gated(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            target = Path(d) / "f.txt"
+            target.write_text("x", encoding="utf-8")
+            tc = [{
+                "function": {
+                    "name": "read_file",
+                    "arguments": {"path": str(target)},
+                },
+            }]
+            loop, _ = _make_loop([_msg(tool_calls=tc), _msg(content="ok")])
+            events = list(loop.run_turn("read"))
+            self.assertFalse(
+                any(isinstance(e, ConfirmRequestEvent) for e in events)
+            )
 
 
 if __name__ == "__main__":
