@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A Claude Code-style agentic coding TUI that runs fully offline against a local Ollama server. The user picks a model (default `qwen3-coder:30b`), and the agent drives a multi-step tool-use loop over file/shell tools, rendered in a Textual terminal UI. Designed for workstations with ~64 GB RAM.
+A Claude Code-style agentic coding TUI that runs fully offline against a local Ollama server. Default model `qwen3-coder:30b`. The agent drives a multi-step tool-use loop (file + shell tools) rendered in a Textual terminal UI. Designed for workstations with ~64 GB RAM.
 
 ## Common commands
 
@@ -14,7 +14,7 @@ ollama serve                             # ensure Ollama is up (Windows installe
 ollama pull qwen3-coder:30b              # pull a model if not present
 python main.py --model qwen3-coder:30b   # run the TUI
 python -m unittest discover tests -v     # run all tests (stdlib unittest, no extra deps)
-python -m unittest tests.test_executor -v                                           # single test module
+python -m unittest tests.test_executor -v                                           # single module
 python -m unittest tests.test_executor.TestToolExecutor.test_read_file_happy_path   # single test
 ```
 
@@ -29,31 +29,34 @@ No linter or build step is configured. Tests cover pure logic only — the live 
 Three layers, strictly separated — keep them that way when editing:
 
 1. **`config.py`** — `AgentConfig` frozen dataclass, the single source of truth for runtime settings. Built once in `main.py` from CLI args.
-2. **`agent/`** — UI-agnostic. `AgentLoop.run_turn()` (`agent/loop.py`) is a generator that yields typed events (`ToolCallEvent`, `ToolResultEvent`, `AssistantChunkEvent`, `AssistantMessageEvent`, `ConfirmRequestEvent`, `ErrorEvent`). It owns the `messages` history and loops calling `ollama.Client.chat(..., stream=True)` until the model stops requesting tools. Hard-capped at `_MAX_TURN_ITERATIONS = 100` tool calls per user turn to guard against a runaway model. **It must never import Textual or call `print()`.**
+2. **`agent/`** — UI-agnostic. `AgentLoop.run_turn()` (`agent/loop.py`) is a generator that yields typed events (`ToolCallEvent`, `ToolResultEvent`, `AssistantChunkEvent`, `AssistantMessageEvent`, `ConfirmRequestEvent`, `ErrorEvent`). Owns the `messages` history and loops calling `ollama.Client.chat(..., stream=True, keep_alive="30m")` until the model stops requesting tools. Hard-capped at `_MAX_TURN_ITERATIONS = 100` per user turn to guard against a runaway model. **Never import Textual here. Never call `print()`.**
 3. **`ui/`** — Textual frontend. `AgentApp` (`ui/app.py`) runs `AgentLoop` on a `@work(thread=True)` background worker and marshals events back via `call_from_thread()`. Input is disabled for the duration of a turn.
 
-### Streaming + confirmation contract
+### Streaming contract
 
-- The loop calls `client.chat(..., stream=True)` and drains the iterator, emitting `AssistantChunkEvent(content=delta)` per non-empty token delta and a single `AssistantMessageEvent(content=full)` at stream end (only when no tool call follows). The UI appends chunks into a persistent `Static` bubble via `ChatDisplay.add_assistant_chunk` and commits the final text with `finalize_assistant_message`.
-- Structured `message.tool_calls` may arrive in any chunk; the loop keeps the last non-empty one. The fenced-JSON fallback parser runs against the fully assembled content after the stream drains.
-- **Sensitive tools** (`_SENSITIVE_TOOLS = {"run_bash", "write_file", "patch_file"}`) are gated. Before dispatch the loop yields a `ConfirmRequestEvent(name, args, reply: threading.Event, approved: list[bool])` and blocks on `reply.wait(timeout=300s)`. The consumer MUST append one bool to `approved` and set `reply`. A denial synthesizes `"ERROR: user denied execution of <tool>"` so the model gets feedback. Read-only tools (`read_file`, `list_directory`, `search_code`) are never gated.
+- `client.chat(..., stream=True)` returns an iterator; `_consume_stream` drains it, emitting `AssistantChunkEvent(delta)` per non-empty token and a single `AssistantMessageEvent(full)` at turn end — but **only when no tool call follows**. Tool-calling responses never emit `AssistantMessageEvent`.
+- During the stream, `ChatDisplay.add_assistant_chunk` appends deltas into a persistent `Static` rendering **plain text** (no Markdown). Markdown parsing runs once in `finalize_assistant_message`. This avoids O(N²) re-parse per token.
+- Structured `message.tool_calls` may arrive in any chunk; last non-empty wins. The fenced-JSON / `<tool_call>` / `<function=...>` fallback parsers (`_extract_text_tool_calls`, `_extract_tag_tool_calls`) run against the assembled content after the stream drains, and results are filtered against registered tool names.
 
-### UI conventions
+### Sensitive-tool confirmation
 
-- Tool calls and results render as compact one-line rows with CSS classes `tool-call` / `tool-result` and an opt-in `hidden` class. `AgentApp` toggles visibility via `Ctrl+T` / `Ctrl+R`; both start hidden.
-- `ErrorEvent` fires three things: an in-scroll red panel, a Textual `notify(severity="error")` toast, and a terminal bell.
-- `ConfirmModal` (`ui/widgets.ConfirmModal`) is a `ModalScreen[bool]` pushed via `call_from_thread`; its dismiss callback populates the event and unblocks the worker.
+- `SENSITIVE_TOOL_NAMES` lives in `agent/tools/definitions.py` alongside `TOOL_SCHEMAS` (single source of truth). Currently: `run_bash`, `write_file`, `patch_file`.
+- Before dispatch the loop yields a `ConfirmRequestEvent`. The consumer calls `event.approve()` or `event.deny()`; the loop waits with `event.wait(timeout=_CONFIRM_TIMEOUT_SECONDS)` (300 s). Timeout or no reply is treated as denial. Denial synthesises `"ERROR: user denied execution of <tool>"` so the model can recover.
+- Read-only tools (`read_file`, `list_directory`, `search_code`) are never gated.
 
 ### Tool layer (`agent/tools/`)
 
-- `definitions.py` — pure data, the JSON schemas sent to the LLM. No imports.
-- `executor.py` — Python implementations. Every tool returns a **plain string**; errors start with `"ERROR: "`. `ToolExecutor.dispatch()` flattens every exception (including `TypeError` for bad arg shapes) into an `ERROR:` string so a buggy tool can't kill the worker thread.
-- Dispatch is via the `_executors` dict built in `ToolExecutor.__init__` — adding a new tool means appending to both `definitions.py` and that dict.
+- `definitions.py` — pure data. `TOOL_SCHEMAS` is the JSON schema sent to the LLM; `SENSITIVE_TOOL_NAMES` is the gating list. No imports.
+- `executor.py` — Python implementations. Every tool returns a **plain string**; errors start with `"ERROR: "`. `ToolExecutor.dispatch()` flattens every exception (including `TypeError` for bad arg shapes) into an `"ERROR: …"` string so a buggy tool can't kill the worker thread.
+- Dispatch is via the `_executors` dict built in `ToolExecutor.__init__`. **Adding a new tool means appending to three places**: `TOOL_SCHEMAS` in `definitions.py`, `_executors` in `executor.py`, and — if it mutates disk or runs code — `SENSITIVE_TOOL_NAMES` in `definitions.py`.
 - **Output caps scale with `--ctx`** (see `ToolExecutor.__init__`): `_file_cap = ctx*4//3`, `_search_cap = ctx*4//20`, `_dir_line_cap = max(50, ctx//80)`. Shrinking `--ctx` shrinks every tool's max output — intentional, so a single read can't blow the window.
 
-### Tool-call parsing fallback
+### UI conventions
 
-Some Ollama models (notably `qwen2.5-coder:7b`) emit tool calls as fenced JSON in `message.content` instead of populating `message.tool_calls`. `agent/loop.py:_extract_text_tool_calls` parses fenced `json` / `tool_call` blocks, and falls back to scanning bare JSON objects with a `"name"` key. Extracted calls are filtered against registered tool names before execution. Pinned by `tests/test_loop_helpers.py` — don't regress this when touching the loop.
+- Tool calls and results render as compact single-line rows with CSS classes `tool-call` / `tool-result` and an opt-in `hidden` class. Both start hidden.
+- `ChatDisplay` owns the per-kind hidden state (`self._hidden: dict[ToolRowKind, bool]`) and exposes `add_tool_row(kind, name, body)` + `toggle_rows_hidden(kind)`. `AgentApp`'s single `action_toggle_rows(kind)` is bound as `Ctrl+T` (`"call"`) and `Ctrl+R` (`"result"`).
+- `ErrorEvent` fires three things: an in-scroll red panel, a Textual `notify(severity="error", timeout=8)` toast, and the terminal bell.
+- `ConfirmModal` (`ui/widgets.ConfirmModal`) is a `ModalScreen[bool]` pushed via `call_from_thread`; its dismiss callback calls `event.approve()` / `event.deny()`.
 
 ### Shell execution
 
@@ -61,7 +64,7 @@ Some Ollama models (notably `qwen2.5-coder:7b`) emit tool calls as fenced JSON i
 
 ### System prompt
 
-Lives in `agent/prompts.py` as a single `SYSTEM_PROMPT` constant — edit there to change agent behavior without touching the loop.
+Lives in `agent/prompts.py` as a single `SYSTEM_PROMPT` constant. Contains strict clarification rules (ask before guessing) and confirmation awareness (sensitive tools are user-gated; denial is a signal, not a retry trigger). Edit there to change agent behavior without touching the loop.
 
 ### Entry point
 

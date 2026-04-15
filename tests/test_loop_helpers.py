@@ -93,5 +93,71 @@ class ExtractTextToolCallsTests(unittest.TestCase):
         self.assertEqual([c["function"]["name"] for c in out], ["fenced"])
 
 
+    def test_tool_call_tag_with_json_body(self) -> None:
+        content = (
+            '<tool_call>\n'
+            '{"name": "list_directory", "arguments": {"path": "."}}\n'
+            '</tool_call>'
+        )
+        out = _extract_text_tool_calls(content)
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["function"]["name"], "list_directory")
+        self.assertEqual(out[0]["function"]["arguments"], {"path": "."})
+
+    def test_function_tag_with_parameter_children(self) -> None:
+        content = (
+            '<tool_call>\n'
+            '<function=list_directory>\n'
+            '<parameter=path>.</parameter>\n'
+            '</function>\n'
+            '</tool_call>'
+        )
+        out = _extract_text_tool_calls(content)
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["function"]["name"], "list_directory")
+        self.assertEqual(out[0]["function"]["arguments"], {"path": "."})
+
+    def test_bare_function_tag_without_tool_call_envelope(self) -> None:
+        content = (
+            '<function=run_bash>\n'
+            '<parameter=command>ls -la</parameter>\n'
+            '</function>'
+        )
+        out = _extract_text_tool_calls(content)
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["function"]["name"], "run_bash")
+        self.assertEqual(out[0]["function"]["arguments"], {"command": "ls -la"})
+
+    def test_function_tag_with_json_body(self) -> None:
+        content = '<function=read_file>{"path": "main.py"}</function>'
+        out = _extract_text_tool_calls(content)
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["function"]["arguments"], {"path": "main.py"})
+
+    def test_parameter_value_numeric_coerced(self) -> None:
+        content = (
+            '<function=search_code>'
+            '<parameter=pattern>foo</parameter>'
+            '<parameter=max_results>5</parameter>'
+            '</function>'
+        )
+        out = _extract_text_tool_calls(content)
+        self.assertEqual(
+            out[0]["function"]["arguments"],
+            {"pattern": "foo", "max_results": 5},
+        )
+
+    def test_function_tag_not_double_counted_inside_tool_call(self) -> None:
+        content = (
+            '<tool_call>'
+            '<function=read_file>'
+            '<parameter=path>x.py</parameter>'
+            '</function>'
+            '</tool_call>'
+        )
+        out = _extract_text_tool_calls(content)
+        self.assertEqual(len(out), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
