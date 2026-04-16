@@ -67,30 +67,39 @@ class AgentApp(App):
     def _run_agent(self, user_text: str) -> None:
         chat = self.query_one(ChatDisplay)
 
-        for event in self._agent.run_turn(user_text):
-            if isinstance(event, ToolCallEvent):
-                self.call_from_thread(
-                    chat.add_tool_row, "call", event.name, str(event.args)
-                )
-            elif isinstance(event, ToolResultEvent):
-                self.call_from_thread(
-                    chat.add_tool_row, "result", event.name, event.result
-                )
-            elif isinstance(event, AssistantChunkEvent):
-                self.call_from_thread(chat.add_assistant_chunk, event.content)
-            elif isinstance(event, AssistantMessageEvent):
-                self.call_from_thread(chat.finalize_assistant_message, event.content)
-            elif isinstance(event, ConfirmRequestEvent):
-                self._handle_confirm(event)
-            elif isinstance(event, ErrorEvent):
-                self.call_from_thread(chat.add_error, event.message)
-                self.call_from_thread(
-                    self.notify, event.message, severity="error", timeout=8
-                )
-                self.call_from_thread(self.bell)
-
-        prompt = self.query_one(PromptInput)
-        self.call_from_thread(self._enable_prompt, prompt)
+        try:
+            for event in self._agent.run_turn(user_text):
+                if isinstance(event, ToolCallEvent):
+                    self.call_from_thread(
+                        chat.add_tool_row, "call", event.name, str(event.args)
+                    )
+                elif isinstance(event, ToolResultEvent):
+                    self.call_from_thread(
+                        chat.add_tool_row, "result", event.name, event.result
+                    )
+                elif isinstance(event, AssistantChunkEvent):
+                    self.call_from_thread(chat.add_assistant_chunk, event.content)
+                elif isinstance(event, AssistantMessageEvent):
+                    self.call_from_thread(chat.finalize_assistant_message, event.content)
+                elif isinstance(event, ConfirmRequestEvent):
+                    self._handle_confirm(event)
+                elif isinstance(event, ErrorEvent):
+                    self.call_from_thread(chat.add_error, event.message)
+                    self.call_from_thread(
+                        self.notify, event.message, severity="error", timeout=8
+                    )
+                    self.call_from_thread(self.bell)
+        except Exception as exc:
+            # Worker must never leave the prompt wedged — surface the crash
+            # and fall through to re-enable input.
+            message = f"Agent worker crashed: {type(exc).__name__}: {exc}"
+            self.call_from_thread(chat.add_error, message)
+            self.call_from_thread(
+                self.notify, message, severity="error", timeout=8
+            )
+        finally:
+            prompt = self.query_one(PromptInput)
+            self.call_from_thread(self._enable_prompt, prompt)
 
     def _handle_confirm(self, event: ConfirmRequestEvent) -> None:
         def _show() -> None:

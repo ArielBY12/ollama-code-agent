@@ -37,7 +37,10 @@ def parse_args() -> argparse.Namespace:
         default=131072,
         help="Context window in tokens (default: 131072)",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.ctx <= 0:
+        parser.error(f"--ctx must be positive, got {args.ctx}")
+    return args
 
 
 def check_ollama(host: str, model: str) -> None:

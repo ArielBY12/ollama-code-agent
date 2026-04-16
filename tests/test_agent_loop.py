@@ -89,6 +89,35 @@ class RunTurnTests(unittest.TestCase):
         self.assertIsInstance(events[-1], AssistantMessageEvent)
         self.assertEqual(events[-1].content, "hi!")
 
+    def test_pydantic_chunks_are_accepted(self) -> None:
+        # ollama>=0.4 yields ChatResponse pydantic objects, not dicts. The
+        # loop must flatten them or the turn ends silently with no output.
+        from ollama import ChatResponse, Message
+
+        chunks = [
+            ChatResponse(
+                model="m",
+                created_at="2025-01-01T00:00:00Z",
+                message=Message(role="assistant", content=ch),
+                done=False,
+            )
+            for ch in "yo"
+        ]
+        chunks.append(
+            ChatResponse(
+                model="m",
+                created_at="2025-01-01T00:00:00Z",
+                message=Message(role="assistant", content=""),
+                done=True,
+            )
+        )
+        loop, _ = _make_loop([chunks])
+        events = list(loop.run_turn("hi"))
+        chunk_deltas = [e.content for e in events if isinstance(e, AssistantChunkEvent)]
+        self.assertEqual("".join(chunk_deltas), "yo")
+        self.assertIsInstance(events[-1], AssistantMessageEvent)
+        self.assertEqual(events[-1].content, "yo")
+
     def test_single_structured_tool_call_then_final_answer(self) -> None:
         with tempfile.TemporaryDirectory() as d:
             target = Path(d) / "f.txt"

@@ -364,7 +364,13 @@ class AgentLoop:
 
         for chunk in stream:
             if not isinstance(chunk, dict):
-                continue
+                # ollama>=0.4 yields pydantic ChatResponse objects. Flatten
+                # to a plain dict so downstream code (which expects dict
+                # tool_calls with a "function" key) keeps working.
+                if hasattr(chunk, "model_dump"):
+                    chunk = chunk.model_dump()
+                else:
+                    continue
             msg = chunk.get("message") or {}
             final_msg = msg if msg else final_msg
 
